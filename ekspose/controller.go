@@ -14,6 +14,8 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 type Controller struct{
@@ -63,6 +65,8 @@ func (c *Controller) processItem() bool{
 	if shutdown{
 		return false
 	}
+	//forget the item from the queue after processing
+	defer c.Queue.Forget(item)
 	key,err := cache.MetaNamespaceKeyFunc(item)
 
 	if(err != nil){
@@ -73,6 +77,27 @@ func (c *Controller) processItem() bool{
 	if err !=nil {
 		fmt.Println("splitting key in to namespace and name :",err.Error())
 		return false
+	}
+
+	//check if the object has been deleted from the cluster
+	ctx := context.Background()
+	_,err = c.Clientset.AppsV1().Deployments(ns).Get(ctx,name,metav1.GetOptions{})
+	if apierrors.IsNotFound(err){
+		fmt.Printf("handle delete event for deployment %s\n",name)
+		//delete service 
+		err := c.Clientset.CoreV1().Services(ns).Delete(ctx,name,metav1.DeleteOptions{})
+		if err != nil{
+			fmt.Printf("deleting service %s error %s\n",name,err.Error())
+			return false
+		}
+
+		//delete ingress
+		err = c.Clientset.NetworkingV1().Ingresses(ns).Delete(ctx,name,metav1.DeleteOptions{})
+		if err != nil{
+			fmt.Printf("deleting ingress %s error %s\n",name,err.Error())
+			return false
+		}
+		return true 
 	}
 
 	err = c.syncDeployment(ns,name)
@@ -113,14 +138,53 @@ func (c *Controller) syncDeployment(ns, name string) error{
 		},
 	}
 	ctx := context.Background()
-	_, err = c.Clientset.CoreV1().Services(ns).Create(ctx,&svc,metav1.CreateOptions{})
+	s, err := c.Clientset.CoreV1().Services(ns).Create(ctx,&svc,metav1.CreateOptions{})
 	if err != nil{
 		fmt.Println("creating service : ",err.Error())
 		return err
 	}
-	return nil
 
 	//create ingress
+	return createIngress(ctx, c.Clientset, s)
+}
+
+func createIngress(ctx context.Context, client kubernetes.Interface, svc *v1.Service) error {
+	pathType := "Prefix"
+	ingress := netv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svc.Name,
+			Namespace: svc.Namespace,
+			Annotations: map[string]string{
+				"nginx.ingress.kubernetes.io/rewrite-target": "/",
+			},
+		},
+		Spec: netv1.IngressSpec{
+			Rules: []netv1.IngressRule{
+				netv1.IngressRule{
+					IngressRuleValue: netv1.IngressRuleValue{
+						HTTP: &netv1.HTTPIngressRuleValue{
+							Paths: []netv1.HTTPIngressPath{
+								netv1.HTTPIngressPath{
+									Path:     fmt.Sprintf("/%s", svc.Name),
+									PathType: (*netv1.PathType)(&pathType),
+									Backend: netv1.IngressBackend{
+										Service: &netv1.IngressServiceBackend{
+											Name: svc.Name,
+											Port: netv1.ServiceBackendPort{
+												Number: 80,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := client.NetworkingV1().Ingresses(svc.Namespace).Create(ctx, &ingress, metav1.CreateOptions{})
+	return err
 }
 
 func deplabels(d appsv1.Deployment) map[string]string{
